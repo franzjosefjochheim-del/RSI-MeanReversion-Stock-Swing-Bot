@@ -1,12 +1,8 @@
 services:
   - type: web
-    name: rsi-swing-dashboard
+    name: rsi-dashboard
     env: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0
-
-  - type: worker
-    name: rsi-swing-bot
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    autoDeploy: true
