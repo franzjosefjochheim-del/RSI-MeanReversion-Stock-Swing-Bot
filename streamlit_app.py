@@ -1,205 +1,156 @@
-# streamlit_app.py
-import time
-from datetime import datetime, timezone
-
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
 import alpaca_trade_api as tradeapi
+import datetime as dt
+import config
+import control
 
-import config  # <- nutzt get_api() + Parameter (WATCHLIST, TIMEFRAME, API_DATA_FEED, etc.)
+# ---------------------------------------------------
+# Streamlit Setup
+# ---------------------------------------------------
+st.set_page_config(page_title="RSI Mean-Reversion Bot – Aktien-Swing", layout="wide")
+st.title("RSI Mean-Reversion Bot – Aktien-Swing")
 
-
-# -------------------------------
-# Seite / Sidebar
-# -------------------------------
-st.set_page_config(page_title="RSI Mean-Reversion – Aktien-Swing", layout="wide")
-
+# ---------------------------------------------------
+# Sidebar Steuerung
+# ---------------------------------------------------
 with st.sidebar:
     st.markdown("### Steuerung")
-    st.write("Status: **AKTIV**")
+    paused = control.is_paused()
+    st.write(f"Status: **{'PAUSIERT' if paused else 'AKTIV'}**")
     colA, colB = st.columns(2)
     if colA.button("Aktualisieren"):
         st.rerun()
-    # optionaler Pause-Button (UI-only; Bot läuft hier nur als Dashboard)
-    st.button("Pause", disabled=True)
+    if not paused:
+        if colB.button("Pause"):
+            control.set_paused(True)
+            st.success("Bot pausiert.")
+            st.rerun()
+    else:
+        if colB.button("Start"):
+            control.set_paused(False)
+            st.success("Bot gestartet.")
+            st.rerun()
 
-st.title("RSI Mean-Reversion Bot – Aktien-Swing")
-
-
-# -------------------------------
-# Hilfsfunktionen (robust)
-# -------------------------------
+# ---------------------------------------------------
+# Alpaca API Client
+# ---------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_api():
-    """Gecachter Alpaca-Client (holt Keys aus config / Render Env)."""
-    return config.get_api()
+    return tradeapi.REST(
+        key_id=config.API_KEY,
+        secret_key=config.API_SECRET,
+        base_url=config.API_BASE_URL,
+        api_version="v2"
+    )
 
-
-def _normalize_bars_df(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    """
-    Normalisiert das Bars-DataFrame:
-    - entpackt MultiIndex (symbol, timestamp) -> nur der Symbol-Teil
-    - stellt sicher, dass 'close' existiert
-    """
-    if df is None or len(df) == 0:
-        return pd.DataFrame()
-
-    # MultiIndex? -> auf Symbol filtern
-    if hasattr(df.index, "levels"):
-        try:
-            df = df.loc[(symbol,), :].copy()
-        except Exception:
-            # Falls das Symbol nicht enthalten ist
-            return pd.DataFrame()
-
-    # Close-Spalte sicherstellen
-    if "close" not in df.columns:
-        # fallback: evtl. heißen Spalten je nach API-Version anders
-        # häufig: 'c' (Polygon) – hier nicht zu erwarten, aber defensiv:
-        if "c" in df.columns:
-            df = df.rename(columns={"c": "close"})
-        else:
-            return pd.DataFrame()
-
-    # leere DF vermeiden
-    if df["close"].dropna().empty:
-        return pd.DataFrame()
-
-    return df
-
-
-def fetch_bars(symbol: str, limit: int = 300) -> pd.DataFrame:
-    """
-    Holt Bars für ein Symbol. Zeigt bei leeren Daten eine freundliche Info.
-    """
-    api = get_api()
-    try:
-        bars = api.get_bars(
-            symbol,
-            config.TIMEFRAME,
-            limit=limit,
-            feed=config.API_DATA_FEED  # "iex" (kostenlos) oder "sip"
-        ).df
-        bars = _normalize_bars_df(bars, symbol)
-        return bars
-    except Exception as e:
-        st.write(f"**{symbol}**: Fehler beim Laden der Bars – {e}")
-        return pd.DataFrame()
-
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Klassischer RSI (Wilder)."""
-    if series is None or series.dropna().empty:
-        return pd.Series(dtype=float)
-    delta = series.diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-
-    roll_up = pd.Series(up, index=series.index).rolling(period).mean()
-    roll_down = pd.Series(down, index=series.index).rolling(period).mean()
-
-    rs = roll_up / (roll_down.replace(0, np.nan))
-    rsi_val = 100 - (100 / (1 + rs))
-    return rsi_val
-
-
-def format_usd(x) -> str:
-    try:
-        return f"{float(x):,.2f} USD"
-    except Exception:
-        return "–"
-
-
-# -------------------------------
-# Metriken (Konto)
-# -------------------------------
 api = get_api()
-try:
-    account = api.get_account()
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Equity", format_usd(account.equity))
-    col2.metric("Cash", format_usd(account.cash))
-    col3.metric("Buying Power", format_usd(account.buying_power))
-except Exception as e:
-    st.warning(f"Konto konnte nicht geladen werden: {e}")
+
+# ---------------------------------------------------
+# Hilfsfunktionen
+# ---------------------------------------------------
+def load_account(api):
+    try:
+        acct = api.get_account()
+        return {
+            "Equity": float(acct.equity),
+            "Cash": float(acct.cash),
+            "Buying Power": float(acct.buying_power),
+        }
+    except Exception as e:
+        st.error(f"Fehler beim Laden des Accounts: {e}")
+        return {"Equity": 0, "Cash": 0, "Buying Power": 0}
 
 
-# -------------------------------
+def load_positions(api):
+    """Alle offenen Positionen laden"""
+    try:
+        positions = api.list_positions()
+        rows = []
+        for p in positions:
+            rows.append({
+                "Symbol": p.symbol,
+                "Qty": float(p.qty),
+                "Entry": float(p.avg_entry_price) if p.avg_entry_price else None,
+                "Unrealized PnL": float(p.unrealized_pl) if p.unrealized_pl else None,
+            })
+        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["Symbol", "Qty", "Entry", "Unrealized PnL"])
+    except Exception as e:
+        st.warning(f"Positionen konnten nicht geladen werden: {e}")
+        return pd.DataFrame(columns=["Symbol", "Qty", "Entry", "Unrealized PnL"])
+
+
+def load_bars(api, symbol: str, timeframe: str, limit: int = 200) -> pd.DataFrame:
+    """Kursdaten holen (MultiIndex beachten)"""
+    try:
+        df = api.get_bars([symbol], timeframe, limit=limit, feed=config.API_DATA_FEED).df
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.loc[(symbol,), :]
+        if df.empty:
+            raise ValueError("Leerer DataFrame vom Feed")
+        return df
+    except Exception as e:
+        st.write(f"**{symbol}:** Keine Daten vom Feed ({e})")
+        return pd.DataFrame()
+
+
+def calc_rsi(prices: pd.Series, period: int = 14):
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+# ---------------------------------------------------
+# Account Anzeige
+# ---------------------------------------------------
+acct = load_account(api)
+col1, col2, col3 = st.columns(3)
+col1.metric("Equity", f"{acct['Equity']:.2f} USD")
+col2.metric("Cash", f"{acct['Cash']:.2f} USD")
+col3.metric("Buying Power", f"{acct['Buying Power']:.2f} USD")
+
+# ---------------------------------------------------
 # Offene Positionen
-# -------------------------------
+# ---------------------------------------------------
 st.subheader("Offene Positionen")
-try:
-    positions = api.get_positions()
-    rows = []
-    for p in positions:
-        rows.append({
-            "Symbol": p.symbol,
-            "Qty": float(p.qty),
-            "Entry": float(p.avg_entry_price),
-            "Unrealized PnL": float(p.unrealized_pl)
-        })
-    if rows:
-        df_pos = pd.DataFrame(rows)
-        st.dataframe(df_pos, use_container_width=True)
-    else:
-        # Leere Tabelle mit Spaltenkopf
-        st.dataframe(pd.DataFrame(columns=["Symbol", "Qty", "Entry", "Unrealized PnL"]),
-                     use_container_width=True)
-except Exception as e:
-    st.write(f"Positionen konnten nicht geladen werden: {e}")
+positions = load_positions(api)
+if not positions.empty:
+    st.dataframe(positions, use_container_width=True)
+else:
+    st.write("Keine offenen Positionen")
 
-
-# -------------------------------
+# ---------------------------------------------------
 # Watchlist & RSI-Signale
-# -------------------------------
+# ---------------------------------------------------
 st.subheader("Watchlist-Signale")
 
-# Übersicht: 4 Spalten – für SPY / QQQ / AAPL / MSFT
-cols = st.columns(4)
-
-watchlist = getattr(config, "WATCHLIST", ["SPY", "QQQ", "AAPL", "MSFT"])
-display_symbols = ["SPY", "QQQ", "AAPL", "MSFT"]
-display_symbols = [s for s in display_symbols if s in watchlist]  # nur was existiert
-
-def signal_for_symbol(symbol: str, rsi_lower=30, rsi_upper=70) -> str:
-    """
-    Ermittelt ein einfaches Mean-Reversion-Signal:
-    - RSI < rsi_lower: 'Kauf-Kandidat'
-    - RSI > rsi_upper: 'Verkauf-Kandidat'
-    - sonst 'Keine Daten / Neutral'
-    """
-    bars = fetch_bars(symbol, limit=200)
-    if bars.empty:
-        return f"{symbol}: **Keine Daten vom Feed**"
-
-    closes = bars["close"].astype(float)
-    r = rsi(closes, period=14)
-    if r.dropna().empty:
-        return f"{symbol}: **Keine RSI-Daten**"
-
-    last_rsi = float(r.iloc[-1])
-    if last_rsi < rsi_lower:
-        return f"{symbol}: RSI {last_rsi:.1f} → **Kauf-Kandidat**"
-    if last_rsi > rsi_upper:
-        return f"{symbol}: RSI {last_rsi:.1f} → **Verkauf-Kandidat**"
-    return f"{symbol}: RSI {last_rsi:.1f} → Neutral"
-
-
-# Je Symbol in eine eigene Spalte
-for idx, sym in enumerate(display_symbols):
-    with cols[idx]:
+cols = st.columns(len(config.WATCHLIST))
+for i, sym in enumerate(config.WATCHLIST):
+    df = load_bars(api, sym, config.TIMEFRAME, limit=200)
+    with cols[i]:
         st.markdown(f"**{sym}:**")
-        st.write(signal_for_symbol(sym))
+        if df.empty:
+            st.write("Keine Daten vom Feed")
+        else:
+            closes = df["close"].astype(float)
+            rsi = calc_rsi(closes)
+            last_rsi = rsi.iloc[-1]
 
+            if last_rsi < config.RSI_LOWER:
+                signal = f"BUY (RSI {last_rsi:.1f})"
+            elif last_rsi > config.RSI_UPPER:
+                signal = f"SELL (RSI {last_rsi:.1f})"
+            else:
+                signal = f"HOLD (RSI {last_rsi:.1f})"
 
-# -------------------------------
-# Fußzeile / Meta-Infos
-# -------------------------------
-st.markdown("---")
-now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-st.caption(
-    f"Watchlist: {', '.join(watchlist)} • "
-    f"Timeframe: **{config.TIMEFRAME}** • Feed: **{config.API_DATA_FEED.upper()}** • "
-    f"Letzte Aktualisierung: {now_utc}"
+            st.write(signal)
+
+# ---------------------------------------------------
+# Footer
+# ---------------------------------------------------
+st.markdown(
+    f"Watchlist: {', '.join(config.WATCHLIST)} • "
+    f"Timeframe: {config.TIMEFRAME} • Feed: {config.API_DATA_FEED.upper()} • "
+    f"Letzte Aktualisierung: {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
 )
