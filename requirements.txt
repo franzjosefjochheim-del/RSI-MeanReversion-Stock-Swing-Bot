@@ -1,0 +1,6 @@
+alpaca_trade_api==3.2.0
+streamlit==1.49.1
+python-dotenv==1.1.1
+pandas==2.3.2
+numpy==2.3.2
+honcho==2.0.0
