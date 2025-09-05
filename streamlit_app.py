@@ -5,8 +5,16 @@ import streamlit as st
 import alpaca_trade_api as tradeapi
 
 import config
-import control
-import strategy  # nutzt: strategy.rsi(series) und strategy.generate_signal_from_df(df)
+import strategy  # erwartet: rsi(series) & generate_signal_from_df(df)
+
+# Optional: Start/Pause (wenn control.py existiert)
+try:
+    import control
+except Exception:
+    class _DummyControl:
+        def is_paused(self): return False
+        def set_paused(self, v): pass
+    control = _DummyControl()
 
 # -------------------------------------------------------
 # Seitensetup
@@ -19,7 +27,12 @@ st.title("RSI Mean-Reversion Bot – Aktien-Swing")
 # -------------------------------------------------------
 with st.sidebar:
     st.markdown("### Steuerung")
-    paused = control.is_paused()
+    paused = False
+    try:
+        paused = control.is_paused()
+    except Exception:
+        paused = False
+
     st.write(f"Status: **{'AKTIV' if not paused else 'PAUSIERT'}**")
 
     colA, colB = st.columns(2)
@@ -27,21 +40,27 @@ with st.sidebar:
         st.rerun()
     if not paused:
         if colB.button("Pause"):
-            control.set_paused(True)
-            st.success("Bot pausiert.")
+            try:
+                control.set_paused(True)
+                st.success("Bot pausiert.")
+            except Exception:
+                st.warning("control.py nicht vorhanden – keine Steuerung möglich.")
             st.rerun()
     else:
         if colB.button("Start"):
-            control.set_paused(False)
-            st.success("Bot gestartet.")
+            try:
+                control.set_paused(False)
+                st.success("Bot gestartet.")
+            except Exception:
+                st.warning("control.py nicht vorhanden – keine Steuerung möglich.")
             st.rerun()
 
 # -------------------------------------------------------
-# Hilfsfunktionen
+# API-Client (NUR hier!)
 # -------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_api():
-    # Sanity Check – vermeidet hässlichen Traceback im UI
+    # Sanity Check
     if not (config.API_KEY and config.API_SECRET and config.API_BASE_URL):
         st.error(
             "Alpaca API-Keys/URL fehlen. "
@@ -57,32 +76,36 @@ def get_api():
 
 api = get_api()
 
-
+# -------------------------------------------------------
+# Kursdaten holen
+# -------------------------------------------------------
 def load_bars(symbol: str, limit: int = 200) -> pd.DataFrame:
     """
-    Holt Bars für ein einzelnes Symbol und gibt einen DataFrame mit 'close' etc. zurück.
+    Holt Bars für ein Symbol und gibt einen DataFrame mit 'close' etc. zurück.
+    Nutzt explizit den konfigurierten Feed (iex für Paper).
     Behandelt MultiIndex (Alpaca) und konvertiert Zahlen-Spalten.
     """
-    df = api.get_bars(symbol, config.TIMEFRAME, limit=limit).df
+    try:
+        df = api.get_bars(symbol, config.TIMEFRAME, limit=limit, feed=config.DATA_FEED).df
+    except TypeError:
+        # Ältere SDK-Version: ohne feed-Argument (Feed ggf. per Env var gesetzt)
+        df = api.get_bars(symbol, config.TIMEFRAME, limit=limit).df
+
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # MultiIndex -> nur die Zeilen des Symbols nehmen
     if isinstance(df.index, pd.MultiIndex):
         try:
             df = df.loc[(symbol,), :]
         except Exception:
-            # falls Alpaca mal kein Level hat – defensiv weiter
             pass
 
-    # numerische Spalten casten
     for c in ("open", "high", "low", "close", "volume", "vwap"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df = df.dropna(subset=["close"])
     return df
-
 
 # -------------------------------------------------------
 # Konto-Infos
@@ -119,31 +142,29 @@ except Exception:
 # -------------------------------------------------------
 st.subheader("Watchlist-Signale")
 
-# Symbole in 3 Spalten verteilen
 cols = st.columns(3)
-
 for i, sym in enumerate(config.WATCHLIST):
     col = cols[i % 3]
     with col:
         try:
-            df = load_bars(sym, limit=max(100, config.RSI_LEN + 20))
+            df = load_bars(sym, limit=max(120, config.RSI_LEN + 30))
             if df.empty or "close" not in df.columns:
                 st.write(f"**{sym}**: Keine Daten")
                 continue
 
-            # RSI + Signal berechnen (robust)
+            # RSI + Signal
             signal = strategy.generate_signal_from_df(df)
-            closes = df["close"].astype(float)
-            r = strategy.rsi(closes).iloc[-1]
+            r = strategy.rsi(df["close"].astype(float)).iloc[-1]
 
-            st.markdown(f"**{sym}** — Signal: `{signal}` • RSI(2): `{r:.1f}`")
-            st.line_chart(closes.tail(90))
+            st.markdown(f"**{sym}** — Signal: `{signal}` • RSI({config.RSI_LEN}): `{r:.1f}`")
+            st.line_chart(df["close"].tail(90))
 
         except Exception as e:
             st.write(f"**{sym}**: Fehler {e}")
 
 st.caption(
     f"Watchlist: {', '.join(config.WATCHLIST)} • "
-    f"Timeframe: {getattr(config.TIMEFRAME, 'name', 'Daily')} • "
+    f"Timeframe: {getattr(config.TIMEFRAME, 'name', 'Day')} • "
+    f"Feed: {config.DATA_FEED.upper()} • "
     f"Letzte Aktualisierung: {time.strftime('%Y-%m-%d %H:%M:%S')} UTC"
 )
