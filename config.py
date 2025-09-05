@@ -1,41 +1,56 @@
 # config.py
+# Einstellungen für den RSI Mean-Reversion Bot (Dashboard)
+
 import os
-import alpaca_trade_api as tradeapi
+import logging
+from dotenv import load_dotenv
 
-# -----------------------------------------------------
-# Alpaca API Keys (werden von Render als Environment Variablen gesetzt)
-# -----------------------------------------------------
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-API_BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+# ---------------------------------------------------
+# .env / Render-Environment einlesen
+# ---------------------------------------------------
+load_dotenv()
 
-# Feed (iex = kostenlos, sip = kostenpflichtig)
-API_DATA_FEED = os.getenv("APCA_API_DATA_FEED", "iex")
+# Alpaca API – Keys & Endpunkte
+# (Auf Render unter Environment Variables setzen)
+API_KEY: str = os.getenv("APCA_API_KEY_ID", "")
+API_SECRET: str = os.getenv("APCA_API_SECRET_KEY", "")
 
-# -----------------------------------------------------
-# Trading Parameter
-# -----------------------------------------------------
-SYMBOL = "AAPL"
+# Paper-Konto als Default (kann via ENV überschrieben werden)
+API_BASE_URL: str = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+
+# Datenfeed: automatisch auf "iex" zurückfallen, falls nicht gesetzt
+API_DATA_FEED: str = os.getenv("APCA_API_DATA_FEED", "iex").lower()
+
+# ---------------------------------------------------
+# Strategie-Parameter (RSI Mean-Reversion)
+# ---------------------------------------------------
+# Watchlist (US-Aktien/ETFs)
 WATCHLIST = ["SPY", "QQQ", "AAPL", "MSFT"]
 
-TIMEFRAME = "1Hour"       # oder "1Day"
-RSI_PERIOD = 14
-RSI_LOWER = 30
-RSI_UPPER = 70
+# Zeitrahmen für die Signale (Alpaca v2 akzeptiert "1Hour", "1Day", ...)
+TIMEFRAME = "1Hour"
 
-MAX_TRADE_USD = 2000.0    # Maximaler Einsatz pro Trade
-STOP_LOSS_PCT = 0.03      # 3% Stop Loss
-TAKE_PROFIT_PCT = 0.06    # 6% Take Profit
+# RSI-Schwellen
+RSI_LOWER = 30    # Oversold → potentielles BUY
+RSI_UPPER = 70    # Overbought → potentielles SELL
 
-# -----------------------------------------------------
-# API Client Factory
-# -----------------------------------------------------
-def get_api():
-    """Initialisiert den Alpaca REST-Client."""
-    if not (API_KEY and API_SECRET and API_BASE_URL):
-        raise ValueError("Fehlende API Keys oder Base URL. Bitte Environment Variablen prüfen.")
-    return tradeapi.REST(
-        key_id=API_KEY,
-        secret_key=API_SECRET,
-        base_url=API_BASE_URL
-    )
+# Konservative Risiko-Defaults (für späteres Auto-Trading nützlich;
+# im reinen Dashboard nicht zwingend verwendet)
+MAX_TRADE_USD = 2000.0   # maximaler Einsatz je Trade
+STOP_LOSS_PCT = 0.03     # 3% Stop Loss
+TAKE_PROFIT_PCT = 0.06   # 6% Take Profit
+
+# ---------------------------------------------------
+# Logging
+# ---------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+# Praktische Zusammenfassung, die wir im Footer anzeigen können
+SUMMARY = {
+    "watchlist": WATCHLIST,
+    "timeframe": TIMEFRAME,
+    "feed": API_DATA_FEED,
+}
