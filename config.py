@@ -1,7 +1,8 @@
 # config.py
 # ---------------------------------------
-# Zentrale Konfiguration + Alpaca-Client
-# (nur alpaca-py, KEIN alpaca_trade_api)
+# Zentrale Konfiguration + Alpaca-Client (nur alpaca-py)
+# Kompatibel mit alpaca-py 0.20.x (neuer Datenclient-Pfad)
+# und optional mit älteren Pfaden (Fallback-Import).
 # ---------------------------------------
 
 from __future__ import annotations
@@ -9,10 +10,21 @@ from __future__ import annotations
 import os
 import streamlit as st
 
-# alpaca-py (v0.20.0)
+# ---- Trading (Account/Orders) ----
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data.historical.client import MarketDataClient
+
+# ---- Market Data (Bars) ----
+# In neueren Versionen (0.20.x) heißt der Client StockHistoricalDataClient
+# und sitzt unter alpaca.data.historical.stock. Ältere Beispiele nutzten
+# MarketDataClient unter alpaca.data.historical.client (nicht mehr vorhanden).
+try:
+    # älterer Pfad (falls in manchen Umgebungen noch vorhanden)
+    from alpaca.data.historical.client import MarketDataClient as _DataClient  # type: ignore
+except Exception:
+    # aktueller Pfad (0.20.x)
+    from alpaca.data.historical.stock import StockHistoricalDataClient as _DataClient  # type: ignore
+
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
@@ -31,16 +43,14 @@ if API_DATA_FEED not in ("iex", "sip"):
 # ================================
 # Strategie-Parameter
 # ================================
-# Watchlist / Symbole
 SYMBOLS = ["SPY", "QQQ", "AAPL", "MSFT"]
-# Alias für Rückwärtskompatibilität
-WATCHLIST = SYMBOLS
+WATCHLIST = SYMBOLS  # Alias für Rückwärtskompatibilität
 
-# Standard-Zeitrahmen + Fallback (wenn 1h nicht verfügbar)
-TIMEFRAME = "1Day"        # "1Day" | "1Hour"
+# Standard-Zeitrahmen + Fallback
+TIMEFRAME = "1Day"          # "1Day" | "1Hour"
 FALLBACK_TIMEFRAME = "1Day"
 
-# RSI-Einstellungen
+# RSI
 RSI_PERIOD = 14
 RSI_LOWER = 30
 RSI_UPPER = 70
@@ -50,12 +60,12 @@ MAX_TRADE_USD = 2000.0
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.06
 
-# Bot-Loop (nur falls Worker separat läuft)
+# Bot-Loop (nur falls ein Worker läuft)
 LOOP_SECONDS = 60 * 5
+
 
 # ===========================================
 # Kompatibilitäts-Wrapper für alpaca-py → REST
-# damit bestehender Code weiter funktioniert
 # ===========================================
 class RestCompat:
     """
@@ -65,14 +75,14 @@ class RestCompat:
 
     def __init__(self, key: str, secret: str, base_url: str):
         self._is_paper = "paper" in (base_url or "").lower()
-        # Trading (Account, Positionen, Orders)
+        # Trading-Client (Account/Positionen/Orders)
         self.trading = TradingClient(
             api_key=key,
             secret_key=secret,
             paper=self._is_paper,
         )
-        # Marktdaten (Bars, Quotes …)
-        self.data = MarketDataClient(
+        # Market-Data-Client (historische Aktien-Bars)
+        self.data = _DataClient(
             api_key=key,
             secret_key=secret,
         )
@@ -82,18 +92,13 @@ class RestCompat:
         return self.trading.get_account()
 
     def get_all_positions(self):
-        # Liefert Liste von Position-Objekten (wie früher)
         return self.trading.get_all_positions()
 
     def close_position(self, symbol: str):
-        # Schließt die gesamte Position für ein Symbol
         return self.trading.close_position(symbol)
 
-    # ---------- Orders (nur falls benötigt) ----------
+    # ---------- Orders (einfaches Beispiel) ----------
     def submit_order(self, symbol: str, qty: float, side: str = "buy"):
-        """
-        Sehr einfache Market-Order. Nur verwenden, wenn dein Code das braucht.
-        """
         from alpaca.trading.requests import MarketOrderRequest
 
         order = MarketOrderRequest(
@@ -106,11 +111,6 @@ class RestCompat:
 
     # ---------- Daten (Bars) ----------
     def get_stock_bars(self, symbols: list[str], timeframe: str = "1Day", limit: int = 100):
-        """
-        Liefert Bars für mehrere Symbole.
-        Beispiel für Nutzung in deinem Code:
-            req = api.get_stock_bars(["SPY"], "1Day", 200)
-        """
         tf = _to_timeframe(timeframe)
         req = StockBarsRequest(
             symbol_or_symbols=symbols,
@@ -121,19 +121,17 @@ class RestCompat:
         return self.data.get_stock_bars(req)
 
 
-# Hilfsfunktion: String → alpaca-py TimeFrame
 def _to_timeframe(tf_str: str) -> TimeFrame:
     s = (tf_str or "").lower()
     if s in ("1day", "1d", "day", "daily"):
         return TimeFrame.Day
     if s in ("1hour", "1h", "hour"):
         return TimeFrame.Hour
-    # Fallback
     return TimeFrame.Day
 
 
 # ================================
-# Bereitstellen eines (gecachten) Clients
+# Gecachter API-Client
 # ================================
 @st.cache_resource(show_spinner=False)
 def get_api() -> RestCompat:
@@ -141,5 +139,4 @@ def get_api() -> RestCompat:
         raise ValueError(
             "❌ Alpaca API Keys fehlen. Bitte APCA_API_KEY_ID und APCA_API_SECRET_KEY setzen."
         )
-    # API_BASE_URL wird derzeit nur genutzt, um paper/live zu erkennen.
     return RestCompat(API_KEY, API_SECRET, API_BASE_URL)
