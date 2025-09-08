@@ -1,18 +1,5 @@
-# --- App ---
-streamlit==1.49.0
-
-# --- Daten/Trading (Alpaca v3 SDK) ---
+streamlit==1.49.1
 alpaca-py==0.20.0
-websockets==11.0.3
-sseclient-py==1.8.0
-pydantic==2.11.7
-typing-extensions>=4.12.2
-msgpack==1.1.1
-
-# --- Data Science ---
 pandas==2.3.2
 numpy==2.3.2
-matplotlib==3.10.6
-
-# --- Utils ---
-requests==2.32.5
+requests==2.32.3
