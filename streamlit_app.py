@@ -1,223 +1,284 @@
 # streamlit_app.py
-import math
-from datetime import datetime, timedelta
+import datetime as dt
+from typing import Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf
 
-import config  # nutzt: get_api(), SYMBOLS, TIMEFRAME, FALLBACK_TIMEFRAME, RSI_* , API_DATA_FEED
+import config  # nutzt: get_api(), SYMBOLS/WATCHLIST, TIMEFRAME, FALLBACK_TIMEFRAME, API_DATA_FEED, RSI_*
 
 
-# =======================================
-# Hilfsfunktionen: Daten & Indikatoren
-# =======================================
+# =========================================
+# Streamlit-Setup
+# =========================================
+st.set_page_config(page_title="RSI Mean-Reversion Bot – Aktien-Swing", layout="wide")
 
-@st.cache_data(show_spinner=False, ttl=300)
-def fetch_bars_alpaca(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
-    """
-    Versucht Bars von Alpaca zu holen (nur sinnvoll mit SIP).
-    Gibt DataFrame mit Spalten ['close'] und DatetimeIndex zurück.
-    """
-    api = config.get_api()
-    # Map Streamlit-Timeframe -> Alpaca
-    tf_map = {"1Day": "1Day", "1Hour": "1Hour"}
-    tf = tf_map.get(timeframe, "1Day")
 
-    # Ende/Start-Zeitraum
-    end = pd.Timestamp.utcnow(tz="UTC")
-    if tf == "1Hour":
-        start = end - pd.Timedelta(days=30)
-    else:
-        start = end - pd.Timedelta(days=365)
+# =========================================
+# Hilfen: Zeit und Formatierung
+# =========================================
+def now_utc() -> dt.datetime:
+    # timezone-aware, ohne Deprecation-Warnung
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
+
+def fmt_usd(x: float) -> str:
     try:
-        bars = api.get_bars(
-            symbol,
-            tf,
-            start=start.isoformat(),
-            end=end.isoformat(),
-            limit=limit,
-            adjustment="raw",
+        return f"{float(x):,.2f} USD"
+    except Exception:
+        return "-"
+
+
+# =========================================
+# Caches
+# =========================================
+@st.cache_resource(show_spinner=False)
+def get_api():
+    return config.get_api()
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def get_account_snapshot() -> Tuple[Optional[dict], Optional[str]]:
+    """Liest Konto (equity, cash, buying_power). Gibt (dict|None, error|None) zurück."""
+    try:
+        api = get_api()
+        acc = api.get_account()
+        data = dict(
+            equity=float(getattr(acc, "equity", 0.0)),
+            cash=float(getattr(acc, "cash", 0.0)),
+            buying_power=float(getattr(acc, "buying_power", 0.0)),
+            currency=getattr(acc, "currency", "USD"),
         )
-        if bars is None or len(bars) == 0:
-            return pd.DataFrame()
-        df = bars.df
-        # Bei mehreren Symbolen liefert Alpaca MultiIndex (symbol, time)
-        if isinstance(df.index, pd.MultiIndex):
-            df = df.xs(symbol, level=0)
-        df = df.sort_index()
-        return df[["close"]].copy()
-    except Exception:
-        return pd.DataFrame()
+        return data, None
+    except Exception as e:
+        return None, f"Konto konnte nicht geladen werden: {e}"
 
 
-@st.cache_data(show_spinner=False, ttl=300)
-def fetch_bars_yf(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
+# =========================================
+# Robuster Positionsabruf
+# =========================================
+def fetch_positions_safely(api) -> list:
     """
-    Holt Bars von Yahoo Finance.
-    Unterstützt '1Day' (1d) und '1Hour' (60m, begrenztes Fenster).
-    Gibt DataFrame mit Spalten ['close'] und DatetimeIndex (UTC) zurück.
+    Liefert eine Liste offener Positionen.
+    Funktioniert mit unterschiedlichen alpaca-trade-api Versionen.
     """
-    if timeframe == "1Hour":
-        interval = "60m"
-        period = "60d"  # yfinance-Beschränkung
-    else:
-        interval = "1d"
-        period = "2y"
-
     try:
-        hist = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
-        if hist is None or hist.empty:
-            return pd.DataFrame()
-        hist = hist.rename(columns=str.lower)
-        # yfinance ist in lokaler TZ; auf UTC vereinheitlichen
-        hist.index = pd.to_datetime(hist.index, utc=True)
-        df = hist[["close"]].copy()
-        if limit and len(df) > limit:
-            df = df.iloc[-limit:]
-        return df
+        if hasattr(api, "get_all_positions"):
+            return api.get_all_positions() or []
+        if hasattr(api, "list_positions"):
+            return api.list_positions() or []
     except Exception:
-        return pd.DataFrame()
+        pass
+    return []
 
 
-def fetch_bars(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
+# =========================================
+# Bars laden (robust für API-Signaturen)
+# =========================================
+@st.cache_data(show_spinner=False, ttl=60)
+def fetch_bars_safely(symbol: str, timeframe: str, limit: int, feed: Optional[str]) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     """
-    Vereinheitlichte Abfrage:
-    - Wenn SIP: zuerst Alpaca, dann Fallback yfinance (zur Sicherheit).
-    - Wenn IEX: direkt yfinance (IEX liefert keine historischen OHLC-Bars).
+    Holt OHLCV-Bars.
+    Versucht unterschiedliche Funktionssignaturen der alpaca-trade-api (3.x).
+    Gibt (DataFrame|None, error|None) zurück.
     """
-    if config.API_DATA_FEED == "sip":
-        df = fetch_bars_alpaca(symbol, timeframe, limit)
-        if df.empty:
-            df = fetch_bars_yf(symbol, timeframe, limit)
-        return df
-    else:  # iex
-        return fetch_bars_yf(symbol, timeframe, limit)
+    api = get_api()
+    err = None
 
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Klassischer RSI (Wilder) auf Schlusskursen."""
-    if series is None or series.empty:
-        return pd.Series(dtype=float)
-
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0.0)).ewm(alpha=1 / period, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1 / period, adjust=False).mean()
-
-    rs = gain / loss.replace(0, pd.NA)
-    rsi_vals = 100 - (100 / (1 + rs))
-    return rsi_vals.fillna(50.0)
-
-
-def generate_signal(close: pd.Series, period: int, lower: float, upper: float) -> tuple[str, float]:
-    """
-    Mean-Reversion RSI:
-      - BUY  wenn RSI < lower
-      - SELL wenn RSI > upper
-      - sonst HOLD
-    Gibt (Signal, letzter_RSI) zurück.
-    """
-    if close is None or len(close) < max(20, period + 2):
-        return "NO DATA", float("nan")
-
-    r = rsi(close, period)
-    last = float(r.iloc[-1])
-    if last < lower:
-        return "BUY", last
-    if last > upper:
-        return "SELL", last
-    return "HOLD", last
-
-
-# =======================================
-# UI / Streamlit
-# =======================================
-
-st.set_page_config(page_title="RSI Mean-Reversion – Aktien-Swing", layout="wide")
-st.title("RSI Mean-Reversion Bot – Aktien-Swing")
-
-# Sidebar-Steuerung
-with st.sidebar:
-    st.markdown("### Steuerung")
-
-    # Timeframe-Auswahl
-    tf_choice = st.radio("Timeframe", options=["1Day", "1Hour"], index=0, horizontal=False)
-
-    # IEX kann keine Intraday-Bars → zurück auf Daily
-    if config.API_DATA_FEED == "iex" and tf_choice == "1Hour":
-        st.info("IEX-Feed liefert **keine Intraday-Bars**. Timeframe wurde auf **1Day** gesetzt.")
-        tf_choice = "1Day"
-
-    if st.button("Aktualisieren"):
-        st.cache_data.clear()
-        st.rerun()
-
-# Account-Kacheln
-api = config.get_api()
-try:
-    account = api.get_account()
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Equity", f"{float(account.equity):,.2f} USD")
-    col2.metric("Cash", f"{float(account.cash):,.2f} USD")
-    col3.metric("Buying Power", f"{float(account.buying_power):,.2f} USD")
-except Exception as e:
-    st.warning(f"⚠️ Konto konnte nicht geladen werden: {e}")
-
-# Offene Positionen
-st.subheader("Offene Positionen")
-try:
-    positions = api.get_positions()  # <- korrekt (kein get_all_positions in deiner Version)
-    if not positions:
-        st.write("empty")
+    # Kandidaten-Aufrufe (ohne 'symbols=' – einige Versionen kennen nur 'symbol')
+    call_variants = []
+    if feed:
+        # mit feed
+        call_variants.append(lambda: api.get_bars(symbol, timeframe, limit=limit, feed=feed))
+        call_variants.append(lambda: api.get_bars(symbol, timeframe, feed=feed))  # Fallback ohne limit
     else:
-        rows = []
-        for p in positions:
-            rows.append(
-                {
-                    "Symbol": p.symbol,
-                    "Qty": float(p.qty),
-                    "Entry": float(p.avg_entry_price),
-                    "Unrealized PnL": float(p.unrealized_pl) if p.unrealized_pl is not None else 0.0,
-                }
-            )
-        st.dataframe(pd.DataFrame(rows), height=240)
-except Exception as e:
-    st.warning(f"⚠️ Positionen konnten nicht geladen werden: {e}")
+        # ohne feed
+        call_variants.append(lambda: api.get_bars(symbol, timeframe, limit=limit))
+        call_variants.append(lambda: api.get_bars(symbol, timeframe))
 
-# Watchlist-Signale
-st.subheader("Watchlist-Signale")
+    for caller in call_variants:
+        try:
+            bars = caller()
+            # Erwartet: pandas.DataFrame
+            if bars is None:
+                continue
 
-grid = st.columns(len(config.SYMBOLS))
-now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            df = bars.df if hasattr(bars, "df") else bars  # einige Versionen liefern .df
+            if df is None or len(df) == 0:
+                continue
 
-for i, sym in enumerate(config.SYMBOLS):
-    with grid[i]:
-        st.markdown(f"**{sym}:**")
-        df = fetch_bars(sym, tf_choice, limit=500)
+            # MultiIndex (symbol, timestamp) → auf Symbol filtern
+            if isinstance(df.index, pd.MultiIndex):
+                if (symbol,) in df.index.get_level_values(0):
+                    df = df.loc[(symbol,)]
+                else:
+                    # ggf. einfach 1. Ebene droppen, falls nur 1 Symbol enthalten ist
+                    try:
+                        df = df.xs(symbol, level=0, drop_level=True)
+                    except Exception:
+                        df = df.droplevel(0)
 
-        if df.empty or "close" not in df.columns or df["close"].dropna().empty:
-            st.write("Keine Daten vom Feed")
+            # Spalten vereinheitlichen
+            cols_lower = [c.lower() for c in df.columns]
+            rename_map = {}
+            if "close" not in cols_lower and "Close" in df.columns:
+                rename_map["Close"] = "close"
+            if rename_map:
+                df = df.rename(columns=rename_map)
+
+            # Nur sinnvolle Spalten behalten
+            keep = [c for c in df.columns if c.lower() in ("open", "high", "low", "close", "volume", "vwap")]
+            if keep:
+                df = df[keep]
+
+            # Index als Zeitstempel
+            if not isinstance(df.index, pd.DatetimeIndex):
+                if "timestamp" in df.columns:
+                    df = df.set_index(pd.to_datetime(df["timestamp"], utc=True))
+                else:
+                    df.index = pd.to_datetime(df.index, utc=True)
+
+            df = df.sort_index()
+            return df, None
+
+        except Exception as e:
+            err = str(e)
             continue
 
-        sig, rsi_val = generate_signal(
-            df["close"], config.RSI_PERIOD, config.RSI_LOWER, config.RSI_UPPER
-        )
+    return None, (f"Keine Bars für {symbol} ({timeframe}). Letzter Fehler: {err}" if err else f"Keine Bars für {symbol} ({timeframe}).")
 
-        if math.isnan(rsi_val):
-            st.write("Zu wenige Datenpunkte")
-        else:
-            st.write(f"RSI: **{rsi_val:.1f}**  •  Signal: **{sig}**")
 
-        # Mini-Chart (Close)
+# =========================================
+# RSI
+# =========================================
+def rsi(series: pd.Series, period: int) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < period + 1:
+        return pd.Series(dtype=float)
+    delta = s.diff()
+    up = delta.clip(lower=0.0)
+    down = -delta.clip(upper=0.0)
+
+    roll_up = up.ewm(alpha=1 / period, adjust=False).mean()
+    roll_down = down.ewm(alpha=1 / period, adjust=False).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    rsi_series = 100 - (100 / (1 + rs))
+    return rsi_series
+
+
+# =========================================
+# Sidebar – Timeframe
+# =========================================
+st.sidebar.markdown("### Steuerung")
+st.sidebar.markdown("**Timeframe**")
+tf_choice = st.sidebar.radio("",
+                             options=[config.FALLBACK_TIMEFRAME, config.TIMEFRAME],
+                             index=0 if config.API_DATA_FEED == "iex" else 1,
+                             label_visibility="collapsed")
+
+effective_tf = tf_choice
+if config.API_DATA_FEED == "iex" and tf_choice.lower() != config.FALLBACK_TIMEFRAME.lower():
+    # IEX hat keine Intraday-Bars → zurück auf 1Day
+    effective_tf = config.FALLBACK_TIMEFRAME
+    st.sidebar.warning("IEX-Feed liefert keine Intraday-Bars. Timeframe wurde auf **1Day** gesetzt.")
+
+if st.sidebar.button("Aktualisieren"):
+    st.cache_data.clear()
+    st.rerun()
+
+
+# =========================================
+# Header-Metriken
+# =========================================
+st.title("RSI Mean-Reversion Bot – Aktien-Swing")
+
+acc, acc_err = get_account_snapshot()
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.metric("Equity", fmt_usd(acc["equity"]) if acc else "–")
+with col2:
+    st.metric("Cash", fmt_usd(acc["cash"]) if acc else "–")
+with col3:
+    st.metric("Buying Power", fmt_usd(acc["buying_power"]) if acc else "–")
+if acc_err:
+    st.warning(acc_err)
+
+
+# =========================================
+# Offene Positionen
+# =========================================
+st.subheader("Offene Positionen")
+api = get_api()
+positions = fetch_positions_safely(api)
+
+if positions:
+    rows = []
+    for p in positions:
         try:
-            st.line_chart(df["close"].tail(120))
+            rows.append(
+                dict(
+                    Symbol=getattr(p, "symbol", ""),
+                    Qty=float(getattr(p, "qty", 0)),
+                    Entry=float(getattr(p, "avg_entry_price", 0)),
+                    Unrealized_PnL=float(getattr(p, "unrealized_pl", 0)),
+                )
+            )
         except Exception:
-            pass
+            continue
+    if rows:
+        df_pos = pd.DataFrame(rows)
+        st.dataframe(df_pos, width="stretch")
+    else:
+        st.info("Keine offenen Positionen.")
+else:
+    st.info("Keine offenen Positionen (oder Trading-Endpoint nicht verfügbar).")
 
-# Fußzeile / Meta
+
+# =========================================
+# Watchlist-Signale
+# =========================================
+st.subheader("Watchlist-Signale")
+
+# Layout: 4 Spalten (SPY, QQQ, AAPL, MSFT)
+cols = st.columns(len(config.WATCHLIST))
+for idx, sym in enumerate(config.WATCHLIST):
+    with cols[idx]:
+        st.markdown(f"**{sym}:**")
+        df, err = fetch_bars_safely(symbol=sym, timeframe=effective_tf, limit=300, feed=config.API_DATA_FEED)
+
+        if df is None or "close" not in df.columns:
+            st.write("Keine Daten vom Feed")
+            if err:
+                st.caption(err)
+            continue
+
+        # RSI berechnen
+        rsi_series = rsi(df["close"], config.RSI_PERIOD)
+        if rsi_series.empty:
+            st.write("Zu wenige Datenpunkte")
+            continue
+
+        last_rsi = float(rsi_series.iloc[-1])
+        signal = "HOLD"
+        if last_rsi <= config.RSI_LOWER:
+            signal = "BUY"
+        elif last_rsi >= config.RSI_UPPER:
+            signal = "SELL"
+
+        st.write(f"RSI({config.RSI_PERIOD}): **{last_rsi:.2f}** → **{signal}**")
+
+        # Optional: letzte 60 Close-Werte zeigen (kleine, schnelle Tabelle)
+        small = df[["close"]].tail(10).copy()
+        small.index.name = "Zeit"
+        small.rename(columns={"close": "Close"}, inplace=True)
+        st.dataframe(small, width="stretch")
+
+
+# =========================================
+# Footer
+# =========================================
 st.caption(
-    f"Watchlist: {', '.join(config.SYMBOLS)} • Timeframe: {tf_choice} "
-    f"• Feed: {'Alpaca/SIP' if config.API_DATA_FEED == 'sip' else 'Yahoo (Fallback für IEX)'} "
-    f"• Letzte Aktualisierung: {now_utc}"
+    f"Watchlist: {', '.join(config.WATCHLIST)} • Timeframe: {effective_tf} "
+    f"• Feed: {config.API_DATA_FEED.upper()} • Letzte Aktualisierung: {now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC"
 )
