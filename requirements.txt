@@ -1,6 +1,18 @@
-alpaca_trade_api==3.2.0
-streamlit==1.49.1
-python-dotenv==1.1.1
-pandas==2.3.2
-numpy==2.3.2
-honcho==2.0.0
+# Streamlit Web-App
+streamlit>=1.38.0
+
+# Alpaca Trading API (REST)
+alpaca-trade-api>=3.2.0
+
+# Data Handling
+pandas>=2.2.2
+numpy>=1.26.4
+
+# Yahoo Finance (Fallback für IEX)
+yfinance>=0.2.40
+
+# HTTP / Requests (meistens schon dabei, aber zur Sicherheit)
+requests>=2.32.3
+
+# Plotting
+matplotlib>=3.9.2
