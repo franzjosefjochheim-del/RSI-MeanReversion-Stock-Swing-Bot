@@ -12,7 +12,18 @@ import streamlit as st
 # alpaca-py (v0.20.0)
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data.historical.client import MarketDataClient
+try:
+    # alpaca-py <= 0.20
+    from alpaca.data.historical.client import MarketDataClient  # type: ignore
+except (ModuleNotFoundError, ImportError):  # pragma: no cover - fallback for newer SDK
+    try:
+        # alpaca-py >= 1.0 (module structure changed)
+        from alpaca.data.historical.stock import (
+            StockHistoricalDataClient as MarketDataClient,
+        )
+    except (ModuleNotFoundError, ImportError):
+        # Some releases expose the class at top-level ``alpaca.data``
+        from alpaca.data import StockHistoricalDataClient as MarketDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
