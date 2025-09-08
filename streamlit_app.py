@@ -6,7 +6,15 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-import config  # nutzt: get_api(), SYMBOLS/WATCHLIST, TIMEFRAME, FALLBACK_TIMEFRAME, API_DATA_FEED, RSI_*
+import config  # get_api(), SYMBOLS/WATCHLIST, TIMEFRAME, FALLBACK_TIMEFRAME, API_DATA_FEED, RSI_*
+
+# ---- NEU: v3 Market-Data (alpaca-py) ----
+try:
+    from alpaca.data import StockHistoricalDataClient, StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    HAVE_V3 = True
+except Exception:
+    HAVE_V3 = False
 
 
 # =========================================
@@ -19,7 +27,6 @@ st.set_page_config(page_title="RSI Mean-Reversion Bot – Aktien-Swing", layout=
 # Hilfen: Zeit und Formatierung
 # =========================================
 def now_utc() -> dt.datetime:
-    # timezone-aware, ohne Deprecation-Warnung
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
 
@@ -38,9 +45,17 @@ def get_api():
     return config.get_api()
 
 
+@st.cache_resource(show_spinner=False)
+def get_v3_client():
+    """v3 Market-Data Client (alpaca-py)."""
+    if not HAVE_V3:
+        return None
+    from os import getenv
+    return StockHistoricalDataClient(getenv("APCA_API_KEY_ID", ""), getenv("APCA_API_SECRET_KEY", ""))
+
+
 @st.cache_data(show_spinner=False, ttl=60)
 def get_account_snapshot() -> Tuple[Optional[dict], Optional[str]]:
-    """Liest Konto (equity, cash, buying_power). Gibt (dict|None, error|None) zurück."""
     try:
         api = get_api()
         acc = api.get_account()
@@ -59,10 +74,6 @@ def get_account_snapshot() -> Tuple[Optional[dict], Optional[str]]:
 # Robuster Positionsabruf
 # =========================================
 def fetch_positions_safely(api) -> list:
-    """
-    Liefert eine Liste offener Positionen.
-    Funktioniert mit unterschiedlichen alpaca-trade-api Versionen.
-    """
     try:
         if hasattr(api, "get_all_positions"):
             return api.get_all_positions() or []
@@ -74,70 +85,105 @@ def fetch_positions_safely(api) -> list:
 
 
 # =========================================
-# Bars laden (robust für API-Signaturen)
+# v3 Bars (Prio 1) + Fallback auf trade_api.get_bars
 # =========================================
+def _map_timeframe(tf_str: str) -> Optional["TimeFrame"]:
+    if not HAVE_V3:
+        return None
+    s = tf_str.lower()
+    if s in ("1day", "1d", "day", "1dayx"):
+        return TimeFrame.Day
+    if s in ("1hour", "1h", "hour"):
+        return TimeFrame.Hour
+    if s in ("15min", "15m"):
+        return TimeFrame.Minute
+    return None
+
+
 @st.cache_data(show_spinner=False, ttl=60)
-def fetch_bars_safely(symbol: str, timeframe: str, limit: int, feed: Optional[str]) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+def fetch_bars(symbol: str, timeframe: str, limit: int, feed: Optional[str]) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     """
-    Holt OHLCV-Bars.
-    Versucht unterschiedliche Funktionssignaturen der alpaca-trade-api (3.x).
-    Gibt (DataFrame|None, error|None) zurück.
+    Holt OHLCV-Bars:
+    1) v3 Market-Data (alpaca-py) – stabil & empfohlen
+    2) Fallback: alpaca_trade_api.REST.get_bars
     """
+    # ---- v3 bevorzugt ----
+    v3 = get_v3_client()
+    tf = _map_timeframe(timeframe)
+    if v3 is not None and tf is not None:
+        try:
+            req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, limit=limit)
+            bars = v3.get_stock_bars(req)
+            df = getattr(bars, "df", None)
+            if df is not None and not df.empty:
+                # MultiIndex (symbol, timestamp) → auf Symbol filtern
+                if isinstance(df.index, pd.MultiIndex):
+                    try:
+                        df = df.xs(symbol, level=0, drop_level=True)
+                    except Exception:
+                        pass
+
+                # einheitliche Spalten
+                rename_map = {}
+                for c in list(df.columns):
+                    if c.lower() == "close" or c == "Close":
+                        rename_map[c] = "close"
+                if rename_map:
+                    df = df.rename(columns=rename_map)
+
+                keep = [c for c in df.columns if c.lower() in ("open", "high", "low", "close", "volume", "vwap")]
+                if keep:
+                    df = df[keep]
+
+                if not isinstance(df.index, pd.DatetimeIndex):
+                    df.index = pd.to_datetime(df.index, utc=True)
+
+                return df.sort_index(), None
+        except Exception as e:
+            # v3 Fehler → wir probieren fallback
+            pass
+
+    # ---- Fallback: trade_api.get_bars ----
     api = get_api()
     err = None
-
-    # Kandidaten-Aufrufe (ohne 'symbols=' – einige Versionen kennen nur 'symbol')
-    call_variants = []
+    candidates = []
     if feed:
-        call_variants.append(lambda: api.get_bars(symbol, timeframe, limit=limit, feed=feed))
-        call_variants.append(lambda: api.get_bars(symbol, timeframe, feed=feed))  # Fallback ohne limit
+        candidates.append(lambda: api.get_bars(symbol, timeframe, limit=limit, feed=feed))
+        candidates.append(lambda: api.get_bars(symbol, timeframe, feed=feed))
     else:
-        call_variants.append(lambda: api.get_bars(symbol, timeframe, limit=limit))
-        call_variants.append(lambda: api.get_bars(symbol, timeframe))
+        candidates.append(lambda: api.get_bars(symbol, timeframe, limit=limit))
+        candidates.append(lambda: api.get_bars(symbol, timeframe))
 
-    for caller in call_variants:
+    for caller in candidates:
         try:
             bars = caller()
-            if bars is None:
-                continue
-
             df = bars.df if hasattr(bars, "df") else bars
-            if df is None or len(df) == 0:
+            if df is None or df.empty:
                 continue
 
-            # MultiIndex (symbol, timestamp) → auf Symbol filtern
             if isinstance(df.index, pd.MultiIndex):
                 try:
                     df = df.xs(symbol, level=0, drop_level=True)
                 except Exception:
-                    # wenn nur 1 Symbol vorhanden ist
                     try:
                         df = df.droplevel(0)
                     except Exception:
                         pass
 
-            # Spalten vereinheitlichen
-            rename_map = {}
             if "close" not in [c.lower() for c in df.columns] and "Close" in df.columns:
-                rename_map["Close"] = "close"
-            if rename_map:
-                df = df.rename(columns=rename_map)
+                df = df.rename(columns={"Close": "close"})
 
-            # Nur relevante Spalten
             keep = [c for c in df.columns if c.lower() in ("open", "high", "low", "close", "volume", "vwap")]
             if keep:
                 df = df[keep]
 
-            # Index in Zeit
             if not isinstance(df.index, pd.DatetimeIndex):
                 if "timestamp" in df.columns:
                     df = df.set_index(pd.to_datetime(df["timestamp"], utc=True))
                 else:
                     df.index = pd.to_datetime(df.index, utc=True)
 
-            df = df.sort_index()
-            return df, None
-
+            return df.sort_index(), None
         except Exception as e:
             err = str(e)
             continue
@@ -164,33 +210,24 @@ def rsi(series: pd.Series, period: int) -> pd.Series:
 
 
 # =========================================
-# Sidebar – Timeframe (mit Label & De-Dupe)
+# Sidebar – Timeframe (fix & ohne Duplikate)
 # =========================================
 st.sidebar.markdown("### Steuerung")
 st.sidebar.markdown("**Timeframe**")
 
-# Optionen erstellen und Duplikate entfernen
 raw_options = [config.FALLBACK_TIMEFRAME, config.TIMEFRAME]
 options = []
 for o in raw_options:
     if o not in options:
         options.append(o)
 
-# Index-Logik: wenn 2 unterschiedliche Werte → bevorzugt TIMEFRAME (Index 1),
-# sonst nur eine Option (Index 0)
 index_default = 0
 if len(options) == 2 and options[0] != options[1]:
-    index_default = 1  # TIMEFRAME steht als 2. in raw_options
+    index_default = 1
 
-tf_choice = st.sidebar.radio(
-    "Timeframe",
-    options=options,
-    index=index_default,
-    key="timeframe_radio",
-)
+tf_choice = st.sidebar.radio("Timeframe", options=options, index=index_default, key="timeframe_radio")
 
 effective_tf = tf_choice
-# IEX hat keine Intraday-Bars → zurück auf 1Day
 if config.API_DATA_FEED.lower() == "iex" and tf_choice.lower() != config.FALLBACK_TIMEFRAME.lower():
     effective_tf = config.FALLBACK_TIMEFRAME
     st.sidebar.warning("IEX-Feed liefert keine Intraday-Bars. Timeframe wurde auf **1Day** gesetzt.")
@@ -256,7 +293,7 @@ cols = st.columns(len(config.WATCHLIST))
 for idx, sym in enumerate(config.WATCHLIST):
     with cols[idx]:
         st.markdown(f"**{sym}:**")
-        df, err = fetch_bars_safely(symbol=sym, timeframe=effective_tf, limit=300, feed=config.API_DATA_FEED)
+        df, err = fetch_bars(symbol=sym, timeframe=effective_tf, limit=300, feed=config.API_DATA_FEED)
 
         if df is None or "close" not in df.columns:
             st.write("Keine Daten vom Feed")
@@ -264,7 +301,6 @@ for idx, sym in enumerate(config.WATCHLIST):
                 st.caption(err)
             continue
 
-        # RSI berechnen
         rsi_series = rsi(df["close"], config.RSI_PERIOD)
         if rsi_series.empty:
             st.write("Zu wenige Datenpunkte")
@@ -280,7 +316,6 @@ for idx, sym in enumerate(config.WATCHLIST):
 
         st.write(f"RSI({config.RSI_PERIOD}): **{last_rsi:.2f}** → **{signal}**")
 
-        # Kleine Tabelle der letzten Close-Werte
         small = df[["close"]].tail(10).copy()
         small.index.name = "Zeit"
         small.rename(columns={"close": "Close"}, inplace=True)
