@@ -3,26 +3,25 @@
 # Zentrale Konfiguration + Alpaca-Client (nur alpaca-py)
 # Kompatibel mit alpaca-py 0.20.x (neuer Datenclient-Pfad)
 # und optional mit älteren Pfaden (Fallback-Import).
+# Enthält Kompatibilitäts-Alias: get_bars(symbol, timeframe, limit) -> DataFrame
 # ---------------------------------------
 
 from __future__ import annotations
 
 import os
 import streamlit as st
+import pandas as pd
 
 # ---- Trading (Account/Orders) ----
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # ---- Market Data (Bars) ----
-# In neueren Versionen (0.20.x) heißt der Client StockHistoricalDataClient
-# und sitzt unter alpaca.data.historical.stock. Ältere Beispiele nutzten
-# MarketDataClient unter alpaca.data.historical.client (nicht mehr vorhanden).
+# Neuer Pfad in 0.20.x: StockHistoricalDataClient
+# (Fallback auf alten Pfad, falls in Umgebung vorhanden)
 try:
-    # älterer Pfad (falls in manchen Umgebungen noch vorhanden)
     from alpaca.data.historical.client import MarketDataClient as _DataClient  # type: ignore
 except Exception:
-    # aktueller Pfad (0.20.x)
     from alpaca.data.historical.stock import StockHistoricalDataClient as _DataClient  # type: ignore
 
 from alpaca.data.requests import StockBarsRequest
@@ -62,6 +61,15 @@ TAKE_PROFIT_PCT = 0.06
 
 # Bot-Loop (nur falls ein Worker läuft)
 LOOP_SECONDS = 60 * 5
+
+
+def _to_timeframe(tf_str: str) -> TimeFrame:
+    s = (tf_str or "").lower()
+    if s in ("1day", "1d", "day", "daily"):
+        return TimeFrame.Day
+    if s in ("1hour", "1h", "hour"):
+        return TimeFrame.Hour
+    return TimeFrame.Day
 
 
 # ===========================================
@@ -109,8 +117,11 @@ class RestCompat:
         )
         return self.trading.submit_order(order_data=order)
 
-    # ---------- Daten (Bars) ----------
+    # ---------- Daten (Bars) – Mehrfachsymbole ----------
     def get_stock_bars(self, symbols: list[str], timeframe: str = "1Day", limit: int = 100):
+        """
+        Rohantwort des alpaca-py DataClients zurückgeben (für mehrere Symbole).
+        """
         tf = _to_timeframe(timeframe)
         req = StockBarsRequest(
             symbol_or_symbols=symbols,
@@ -120,14 +131,45 @@ class RestCompat:
         )
         return self.data.get_stock_bars(req)
 
+    # ---------- Daten (Bars) – Alias im Stil der alten REST.get_bars ----------
+    def get_bars(self, symbol: str, timeframe: str = "1Day", limit: int = 100) -> pd.DataFrame:
+        """
+        Kompatibilitäts-Alias. Liefert ein Pandas-DataFrame mit Spalten:
+        ['timestamp','open','high','low','close','volume'] – sortiert nach Zeit.
+        """
+        resp = self.get_stock_bars([symbol], timeframe=timeframe, limit=limit)
 
-def _to_timeframe(tf_str: str) -> TimeFrame:
-    s = (tf_str or "").lower()
-    if s in ("1day", "1d", "day", "daily"):
-        return TimeFrame.Day
-    if s in ("1hour", "1h", "hour"):
-        return TimeFrame.Hour
-    return TimeFrame.Day
+        # Struktur tolerant auslesen (alpaca-py liefert i. d. R. resp.data[<symbol>] -> Liste von Bar-Objekten)
+        bars_iter = []
+        if hasattr(resp, "data") and isinstance(resp.data, dict):
+            # Typisch: resp.data == { 'AAPL': [Bar, Bar, ...] }
+            bars_iter = next(iter(resp.data.values()), [])
+        elif hasattr(resp, "bars"):  # sehr alte Varianten
+            bars_iter = getattr(resp, "bars")
+        else:
+            # Fallback – besser gar nichts ausgeben als crashen
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+        rows = []
+        for b in bars_iter or []:
+            # Bar-Objekt hat Attribute: timestamp, open, high, low, close, volume (Namensgleichheit ist üblich)
+            ts = getattr(b, "timestamp", None)
+            rows.append(
+                {
+                    "timestamp": ts,
+                    "open": float(getattr(b, "open", float("nan"))),
+                    "high": float(getattr(b, "high", float("nan"))),
+                    "low": float(getattr(b, "low", float("nan"))),
+                    "close": float(getattr(b, "close", float("nan"))),
+                    "volume": int(getattr(b, "volume", 0)),
+                }
+            )
+
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            # sauber nach Zeit aufsteigend sortieren
+            df = df.sort_values("timestamp").reset_index(drop=True)
+        return df
 
 
 # ================================
