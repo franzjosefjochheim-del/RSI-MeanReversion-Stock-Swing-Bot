@@ -2,7 +2,17 @@ services:
   - type: web
     name: rsi-dashboard
     env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
+    plan: free  # oder standard / starter / pro, je nach deinem Render-Account
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
     startCommand: streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0
-    autoDeploy: true
+    envVars:
+      - key: APCA_API_KEY_ID
+        sync: false   # in Render Dashboard setzen
+      - key: APCA_API_SECRET_KEY
+        sync: false   # in Render Dashboard setzen
+      - key: APCA_API_BASE_URL
+        sync: false   # Default: https://paper-api.alpaca.markets
+      - key: APCA_API_DATA_FEED
+        sync: false   # "iex" oder "sip"
