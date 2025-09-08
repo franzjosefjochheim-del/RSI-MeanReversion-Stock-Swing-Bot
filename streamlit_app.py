@@ -89,50 +89,46 @@ def fetch_bars_safely(symbol: str, timeframe: str, limit: int, feed: Optional[st
     # Kandidaten-Aufrufe (ohne 'symbols=' – einige Versionen kennen nur 'symbol')
     call_variants = []
     if feed:
-        # mit feed
         call_variants.append(lambda: api.get_bars(symbol, timeframe, limit=limit, feed=feed))
         call_variants.append(lambda: api.get_bars(symbol, timeframe, feed=feed))  # Fallback ohne limit
     else:
-        # ohne feed
         call_variants.append(lambda: api.get_bars(symbol, timeframe, limit=limit))
         call_variants.append(lambda: api.get_bars(symbol, timeframe))
 
     for caller in call_variants:
         try:
             bars = caller()
-            # Erwartet: pandas.DataFrame
             if bars is None:
                 continue
 
-            df = bars.df if hasattr(bars, "df") else bars  # einige Versionen liefern .df
+            df = bars.df if hasattr(bars, "df") else bars
             if df is None or len(df) == 0:
                 continue
 
             # MultiIndex (symbol, timestamp) → auf Symbol filtern
             if isinstance(df.index, pd.MultiIndex):
-                if (symbol,) in df.index.get_level_values(0):
-                    df = df.loc[(symbol,)]
-                else:
-                    # ggf. einfach 1. Ebene droppen, falls nur 1 Symbol enthalten ist
+                try:
+                    df = df.xs(symbol, level=0, drop_level=True)
+                except Exception:
+                    # wenn nur 1 Symbol vorhanden ist
                     try:
-                        df = df.xs(symbol, level=0, drop_level=True)
-                    except Exception:
                         df = df.droplevel(0)
+                    except Exception:
+                        pass
 
             # Spalten vereinheitlichen
-            cols_lower = [c.lower() for c in df.columns]
             rename_map = {}
-            if "close" not in cols_lower and "Close" in df.columns:
+            if "close" not in [c.lower() for c in df.columns] and "Close" in df.columns:
                 rename_map["Close"] = "close"
             if rename_map:
                 df = df.rename(columns=rename_map)
 
-            # Nur sinnvolle Spalten behalten
+            # Nur relevante Spalten
             keep = [c for c in df.columns if c.lower() in ("open", "high", "low", "close", "volume", "vwap")]
             if keep:
                 df = df[keep]
 
-            # Index als Zeitstempel
+            # Index in Zeit
             if not isinstance(df.index, pd.DatetimeIndex):
                 if "timestamp" in df.columns:
                     df = df.set_index(pd.to_datetime(df["timestamp"], utc=True))
@@ -168,18 +164,34 @@ def rsi(series: pd.Series, period: int) -> pd.Series:
 
 
 # =========================================
-# Sidebar – Timeframe
+# Sidebar – Timeframe (mit Label & De-Dupe)
 # =========================================
 st.sidebar.markdown("### Steuerung")
 st.sidebar.markdown("**Timeframe**")
-tf_choice = st.sidebar.radio("",
-                             options=[config.FALLBACK_TIMEFRAME, config.TIMEFRAME],
-                             index=0 if config.API_DATA_FEED == "iex" else 1,
-                             label_visibility="collapsed")
+
+# Optionen erstellen und Duplikate entfernen
+raw_options = [config.FALLBACK_TIMEFRAME, config.TIMEFRAME]
+options = []
+for o in raw_options:
+    if o not in options:
+        options.append(o)
+
+# Index-Logik: wenn 2 unterschiedliche Werte → bevorzugt TIMEFRAME (Index 1),
+# sonst nur eine Option (Index 0)
+index_default = 0
+if len(options) == 2 and options[0] != options[1]:
+    index_default = 1  # TIMEFRAME steht als 2. in raw_options
+
+tf_choice = st.sidebar.radio(
+    "Timeframe",
+    options=options,
+    index=index_default,
+    key="timeframe_radio",
+)
 
 effective_tf = tf_choice
-if config.API_DATA_FEED == "iex" and tf_choice.lower() != config.FALLBACK_TIMEFRAME.lower():
-    # IEX hat keine Intraday-Bars → zurück auf 1Day
+# IEX hat keine Intraday-Bars → zurück auf 1Day
+if config.API_DATA_FEED.lower() == "iex" and tf_choice.lower() != config.FALLBACK_TIMEFRAME.lower():
     effective_tf = config.FALLBACK_TIMEFRAME
     st.sidebar.warning("IEX-Feed liefert keine Intraday-Bars. Timeframe wurde auf **1Day** gesetzt.")
 
@@ -240,7 +252,6 @@ else:
 # =========================================
 st.subheader("Watchlist-Signale")
 
-# Layout: 4 Spalten (SPY, QQQ, AAPL, MSFT)
 cols = st.columns(len(config.WATCHLIST))
 for idx, sym in enumerate(config.WATCHLIST):
     with cols[idx]:
@@ -260,15 +271,16 @@ for idx, sym in enumerate(config.WATCHLIST):
             continue
 
         last_rsi = float(rsi_series.iloc[-1])
-        signal = "HOLD"
         if last_rsi <= config.RSI_LOWER:
             signal = "BUY"
         elif last_rsi >= config.RSI_UPPER:
             signal = "SELL"
+        else:
+            signal = "HOLD"
 
         st.write(f"RSI({config.RSI_PERIOD}): **{last_rsi:.2f}** → **{signal}**")
 
-        # Optional: letzte 60 Close-Werte zeigen (kleine, schnelle Tabelle)
+        # Kleine Tabelle der letzten Close-Werte
         small = df[["close"]].tail(10).copy()
         small.index.name = "Zeit"
         small.rename(columns={"close": "Close"}, inplace=True)
