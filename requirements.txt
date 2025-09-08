@@ -1,18 +1,16 @@
-# Streamlit Web-App
+# Web UI
 streamlit>=1.38.0
 
-# Alpaca Trading API (REST)
+# Alpaca APIs
 alpaca-trade-api>=3.2.0
+alpaca-py==0.20.0
 
 # Data Handling
 pandas>=2.2.2
 numpy>=1.26.4
 
-# Yahoo Finance (Fallback für IEX)
-yfinance>=0.2.40
-
-# HTTP / Requests (meistens schon dabei, aber zur Sicherheit)
+# HTTP
 requests>=2.32.3
 
-# Plotting
+# Plotting (falls später benötigt)
 matplotlib>=3.9.2
