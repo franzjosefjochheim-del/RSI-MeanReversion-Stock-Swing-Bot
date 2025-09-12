@@ -8,84 +8,75 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-import config
+import config  # liefert get_market_data_client(), data_feed_label(), SYMBOLS usw.
+
+# Zusätzliche Alpaca-Imports (nur Typen/Requests, kein alter MarketDataClient-Import!)
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame as DataTimeFrame
-from alpaca.data.historical.client import MarketDataClient
-from alpaca.trading.client import TradingClient
+from alpaca.trading.client import TradingClient  # Teil von alpaca-py (OK)
 
 
-# ---------- UI Basics ----------
+# ---------------- UI-Basis ----------------
 st.set_page_config(page_title="RSI Mean-Reversion – Aktien-Swing", layout="wide")
-
 st.title("RSI Mean-Reversion Bot – Aktien-Swing")
 
 with st.sidebar:
     st.header("Steuerung")
+    # IEX (Paper) liefert zuverlässig Daily-Bars
     tf_choice = st.radio(
         "Timeframe",
-        options=["1Day"],  # IEX (Paper) liefert zuverlässig nur Daily
+        options=["1Day"],
         index=0,
-        help="IEX im Paper-Account liefert Daily-Bars. Intraday ist hier absichtlich deaktiviert.",
+        help="IEX im Paper-Account liefert Daily-Bars. Intraday ist deaktiviert.",
     )
-    if config.APP.data_feed.name.lower() == "iex" and tf_choice != "1Day":
-        st.info("IEX liefert im Paper-Account keine Intraday-Bars – umgestellt auf 1Day.")
-        tf_choice = "1Day"
-
-# ---------- Clients ----------
-trading: TradingClient = config.get_trading_client()
-mkt: MarketDataClient = config.get_market_client()
+    st.caption(f"Feed: **{config.data_feed_label()}**")
 
 
-# ---------- Helper ----------
+# ---------------- Clients ----------------
+# Market Data Client aus config (intern: StockHistoricalDataClient)
+md_client = config.get_market_data_client()
+
+# TradingClient (nur zum Anzeigen von Account/Positionen; Orders platzieren wir hier nicht)
+trading = TradingClient(config.API_KEY, config.API_SECRET, paper=True)
+
+
+# ---------------- Helfer ----------------
 def utc_now() -> dt.datetime:
-    # timezone-aware UTC (keine Deprecation-Warnung)
     return dt.datetime.now(dt.timezone.utc)
 
 
 @st.cache_data(show_spinner=False, ttl=300)
-def fetch_bars(
-    symbols: List[str], timeframe: str, days_back: int = 300
-) -> Dict[str, pd.DataFrame]:
+def fetch_bars(symbols: List[str], timeframe: str, days_back: int = 500) -> Dict[str, pd.DataFrame]:
     """
-    Holt Bars via MarketDataClient (eigener Endpoint!), IEX/SIP je nach Config.
+    Holt Bars via alpaca-py Market Data Client (IEX/SIP je nach Config).
     Gibt pro Symbol ein DataFrame mit Spalten ['open','high','low','close','volume'] zurück.
     """
-    tf: DataTimeFrame = config.TF_MAP.get(timeframe, DataTimeFrame.Day)
-
+    tf: DataTimeFrame = DataTimeFrame.Day  # einzig aktivierter TF in der UI
     end = utc_now()
     start = end - dt.timedelta(days=days_back)
 
     out: Dict[str, pd.DataFrame] = {}
-
-    # Alpaca erlaubt Multi-Symbol-Requests, wir gehen bewusst symbolweise (robuster)
     for sym in symbols:
-        req = StockBarsRequest(
-            symbol_or_symbols=[sym],
-            timeframe=tf,
-            start=start,
-            end=end,
-            limit=1000,
-            feed=config.APP.data_feed,
-        )
         try:
-            resp = mkt.get_stock_bars(req)
-            bars = resp.df  # MultiIndex: (symbol, timestamp)
+            req = StockBarsRequest(
+                symbol_or_symbols=[sym],
+                timeframe=tf,
+                start=start,
+                end=end,
+                limit=1000,
+                feed=config.API_DATA_FEED,  # "iex" oder "sip"
+            )
+            resp = md_client.get_stock_bars(req)
+            bars = resp.df  # MultiIndex (symbol, timestamp) → DataFrame
+
             if bars is None or bars.empty:
                 out[sym] = pd.DataFrame()
                 continue
 
-            # nur das eine Symbol, Index glätten
-            df = bars.xs(sym, level=0)
-            df = df.reset_index().rename(columns={"timestamp": "time"})
+            df = bars.xs(sym, level=0).reset_index().rename(columns={"timestamp": "time"})
             df = df.set_index("time").sort_index()
-
-            # nur die relevanten Spalten
-            keep = ["open", "high", "low", "close", "volume"]
-            df = df[keep]
-
-            out[sym] = df
-        except Exception as e:
+            out[sym] = df[["open", "high", "low", "close", "volume"]]
+        except Exception:
             out[sym] = pd.DataFrame()
     return out
 
@@ -103,7 +94,6 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return out.fillna(50)
 
 
-# ---------- Account-Kacheln ----------
 def fmt_usd(x: float | str) -> str:
     try:
         return f"{float(x):,.2f} USD"
@@ -111,16 +101,18 @@ def fmt_usd(x: float | str) -> str:
         return str(x)
 
 
+# ---------------- Account-Kacheln ----------------
 try:
     account = trading.get_account()
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Equity", fmt_usd(account.equity))
-    col2.metric("Cash", fmt_usd(account.cash))
-    col3.metric("Buying Power", fmt_usd(account.buying_power))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Equity", fmt_usd(account.equity))
+    c2.metric("Cash", fmt_usd(account.cash))
+    c3.metric("Buying Power", fmt_usd(account.buying_power))
 except Exception as e:
     st.warning(f"Konto konnte nicht geladen werden: {e}")
 
-# ---------- Offene Positionen ----------
+
+# ---------------- Offene Positionen ----------------
 st.subheader("Offene Positionen")
 try:
     positions = trading.get_all_positions()
@@ -129,49 +121,45 @@ try:
     else:
         rows = []
         for p in positions:
-            rows.append(
-                {
-                    "Symbol": p.symbol,
-                    "Qty": float(p.qty),
-                    "Entry": float(p.avg_entry_price),
-                    "Unrealized PnL": float(p.unrealized_pl),
-                }
-            )
+            rows.append({
+                "Symbol": p.symbol,
+                "Qty": float(p.qty),
+                "Entry": float(p.avg_entry_price),
+                "Unrealized PnL": float(p.unrealized_pl),
+            })
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
 except Exception as e:
     st.warning(f"Positionen konnten nicht geladen werden: {e}")
 
-# ---------- Watchlist-Signale ----------
+
+# ---------------- Watchlist-Signale ----------------
 st.subheader("Watchlist-Signale")
+bars_map = fetch_bars(config.SYMBOLS, tf_choice, days_back=500)
 
-bars_map = fetch_bars(config.APP.symbols, tf_choice, days_back=500)
-
-grid = st.columns(4)
-for i, sym in enumerate(config.APP.symbols):
-    with grid[i % 4]:
+cols = st.columns(4)
+for i, sym in enumerate(config.SYMBOLS):
+    with cols[i % 4]:
         st.markdown(f"**{sym}:**")
         df = bars_map.get(sym, pd.DataFrame())
         if df is None or df.empty:
-            st.write("Keine Daten vom Feed")
+            st.write(f"⚠️ Keine Bars für {sym} (Feed: {config.data_feed_label()}, TF: {tf_choice})")
             continue
 
         df = df.copy()
-        df["rsi"] = rsi(df["close"], period=config.APP.rsi_period)
+        df["rsi"] = rsi(df["close"], period=config.RSI_PERIOD)
+        last_rsi = float(df["rsi"].iloc[-1])
 
-        latest = df.iloc[-1]
-        last_rsi = float(latest["rsi"])
-
-        signal = "—"
-        if last_rsi <= config.APP.rsi_lower:
+        if last_rsi <= config.RSI_LOWER:
             signal = "📉 Oversold → Watch LONG"
-        elif last_rsi >= config.APP.rsi_upper:
+        elif last_rsi >= config.RSI_UPPER:
             signal = "📈 Overbought → Watch EXIT"
+        else:
+            signal = "—"
 
         st.write(f"RSI: {last_rsi:.1f} • TF: {tf_choice}")
         st.write(signal)
 
-# Fußzeile
 st.caption(
-    f"Watchlist: {', '.join(config.APP.symbols)} • Timeframe: {tf_choice} • "
-    f"Feed: {config.APP.data_feed.name.lower()} • Letzte Aktualisierung: {utc_now():%Y-%m-%d %H:%M:%S %Z}"
+    f"Watchlist: {', '.join(config.SYMBOLS)} • TF: {tf_choice} • "
+    f"Feed: {config.data_feed_label()} • Letzte Aktualisierung: {utc_now():%Y-%m-%d %H:%M:%S %Z}"
 )
