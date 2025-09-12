@@ -1,11 +1,7 @@
 streamlit==1.49.1
 
-# Markt-Daten (alpaca-py: neueres SDK)
+# Alpaca SDK (neue Variante, enthält Trading + Market Data)
 alpaca-py==0.20.0
-
-# Trading-API NUR, wenn du Orders platzieren willst.
-# Falls NICHT benötigt → diese Zeile weglassen.
-alpaca-trade-api==3.2.0
 
 pandas==2.3.2
 numpy==2.3.2
