@@ -1,222 +1,174 @@
-# trading_engine.py
-# ------------------------------------------------------------
-# Autonomer RSI-Mean-Reversion-Bot für Alpaca (Paper-Account)
-# - holt Bars (IEX, 1Day), berechnet RSI
-# - kauft, wenn RSI < RSI_LOWER und keine Position vorhanden
-# - verkauft, wenn RSI > RSI_UPPER und Position vorhanden
-# - optional Bracket-Order (Stop-Loss/Take-Profit) beim Einstieg
-# - kann einmalig (--once) oder in Schleife (--loop) laufen
-# ------------------------------------------------------------
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-from __future__ import annotations
+"""
+RSI Mean-Reversion – Trading Engine
+- Läuft als --once (einmal handeln) oder --loop (Endlosschleife)
+- Nutzt IMMER die letzte ABGESCHLOSSENE Kerze für TF=1Day
+"""
+
 import os
+import sys
 import time
-import math
 import argparse
-import traceback
-from typing import List, Optional
+import datetime as dt
+from typing import Optional, Dict, List
 
+from alpaca.data.historical.client import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 import pandas as pd
 import numpy as np
 
-# === deine bestehende Konfiguration wird hier verwendet ===
-import config
+# --- Konfiguration aus ENV ---
+API_KEY = os.getenv("APCA_API_KEY_ID", "")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
+API_BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+API_DATA_FEED = os.getenv("APCA_API_DATA_FEED", "iex").lower()  # iex oder sip
 
-# Alpaca-py (Daten & Trading)
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+WATCHLIST = ["SPY", "QQQ", "AAPL", "MSFT"]
+TIMEFRAME = "1Day"  # nur Daily vorgesehen
+RSI_PERIOD = 14
+RSI_LOW = 30.0
+RSI_HIGH = 70.0
+LOOP_INTERVAL_SEC = 300
 
+def _now_utc() -> dt.datetime:
+    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
 
-# -------------- Utilities --------------
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Einfacher RSI auf Schlusskursen."""
+    delta = series.diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    gain_sma = pd.Series(gain, index=series.index).rolling(period, min_periods=period).mean()
+    loss_sma = pd.Series(loss, index=series.index).rolling(period, min_periods=period).mean()
+    rs = gain_sma / loss_sma
+    out = 100.0 - (100.0 / (1.0 + rs))
+    return out
 
-def log(msg: str) -> None:
-    print(f"[BOT] {msg}", flush=True)
+def get_market_client() -> StockHistoricalDataClient:
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError("API-Schlüssel fehlen (APCA_API_KEY_ID / APCA_API_SECRET_KEY).")
+    return StockHistoricalDataClient(API_KEY, API_SECRET)
 
-
-def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    """Wilder RSI."""
-    if len(close) < period + 1:
-        return pd.Series(index=close.index, dtype=float)
-
-    delta = close.diff()
-    gain = delta.clip(lower=0.0).rolling(period).mean()
-    loss = (-delta.clip(upper=0.0)).rolling(period).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-
-def get_clients():
-    """Erzeuge Market-Data- & Trading-Client."""
-    api_key = config.API_KEY
-    api_secret = config.API_SECRET
-
-    # Daten (IEX – daily)
-    data_client = StockHistoricalDataClient(api_key, api_secret)
-
-    # Trading (Paper)
-    trading_client = TradingClient(api_key, api_secret, paper=True)
-    return data_client, trading_client
-
-
-def fetch_last_close_and_rsi(
-    data_client: StockHistoricalDataClient,
-    symbol: str,
-    limit: int = 200,
-    timeframe: str = "1Day",
-    rsi_period: int = None,
-) -> tuple[Optional[float], Optional[float]]:
-    """Holt Bars & berechnet RSI. Liefert (last_close, last_rsi)."""
-    if rsi_period is None:
-        rsi_period = config.RSI_PERIOD
-
-    tf = TimeFrame.Day if timeframe.lower() in ("1day", "day", "1d") else TimeFrame.Hour
+def fetch_daily_bars(symbol: str, lookback_days: int = 400) -> pd.DataFrame:
+    """Holt ausreichend viele Tageskerzen und liefert DataFrame mit Spalten ['t','o','h','l','c','v'].
+    Wir nehmen später die letzte ABGESCHLOSSENE Kerze."""
+    client = get_market_client()
+    end = _now_utc()
+    start = end - dt.timedelta(days=lookback_days)
 
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
-        timeframe=tf,
-        limit=limit,
-        feed=config.API_DATA_FEED,  # "iex"
+        timeframe=TimeFrame.Day,
+        start=start,
+        end=end,
+        adjustment="raw",
+        feed=API_DATA_FEED,
+        limit=5000,
     )
-    bars = data_client.get_stock_bars(req).df
-    if bars is None or bars.empty:
-        return None, None
+    resp = client.get_stock_bars(req)
+    if symbol not in resp.data or len(resp.data[symbol]) == 0:
+        return pd.DataFrame()
 
-    # Falls Multiindex (symbol, time)
-    if isinstance(bars.index, pd.MultiIndex):
-        bars = bars.xs(symbol, level=0)
+    rows = []
+    for bar in resp.data[symbol]:
+        rows.append({
+            "t": pd.Timestamp(bar.timestamp).tz_convert("UTC"),
+            "o": float(bar.open),
+            "h": float(bar.high),
+            "l": float(bar.low),
+            "c": float(bar.close),
+            "v": int(bar.volume or 0),
+        })
+    df = pd.DataFrame(rows).sort_values("t").reset_index(drop=True)
+    return df
 
-    closes = bars["close"].astype(float)
-    rsi = compute_rsi(closes, period=rsi_period)
-    last_close = float(closes.iloc[-1])
-    last_rsi = float(rsi.iloc[-1]) if not np.isnan(rsi.iloc[-1]) else None
-    return last_close, last_rsi
+def last_completed_daily_row(df: pd.DataFrame) -> Optional[pd.Series]:
+    """Gibt die letzte ABGESCHLOSSENE Tageszeile zurück."""
+    if df.empty:
+        return None
+    # Eine Tageskerze ist abgeschlossen, wenn ihr Datum < heute_UTC ist.
+    today_utc = pd.Timestamp(_now_utc().date(), tz="UTC")
+    completed = df[df["t"] < today_utc].copy()
+    if completed.empty:
+        # Fallback: manchmal ist die letzte Kerze schon „fertig“ obwohl t == today (je nach Anbieter).
+        # Dann nehmen wir einfach die vorletzte Kerze.
+        if len(df) >= 2:
+            return df.iloc[-2]
+        return None
+    return completed.iloc[-1]
 
+def compute_rsi_on_df(df: pd.DataFrame, period: int = RSI_PERIOD) -> Optional[float]:
+    if df.empty or len(df) < period + 1:
+        return None
+    df = df.copy()
+    df["rsi"] = rsi(df["c"], period=period)
+    return float(df["rsi"].iloc[-1])
 
-def get_position_qty(trading_client: TradingClient, symbol: str) -> int:
-    """Liefert Stückzahl offener Position; 0 wenn keine."""
-    try:
-        pos = trading_client.get_open_position(symbol)
-        return int(float(pos.qty))
-    except Exception:
-        return 0
+def decide_action(last_close: float, last_rsi: float) -> str:
+    """Einfache Mean-Reversion-Heuristik."""
+    if last_rsi is None:
+        return "SKIP"
+    if last_rsi <= RSI_LOW:
+        return "BUY"
+    if last_rsi >= RSI_HIGH:
+        return "SELL"
+    return "HOLD"
 
+def trade_once() -> None:
+    print(f"[BOT] Starte Runde • Feed={API_DATA_FEED} • TF={TIMEFRAME}")
+    for symbol in WATCHLIST:
+        try:
+            df = fetch_daily_bars(symbol)
+            if df.empty:
+                print(f"[BOT] {symbol}: Keine Bars – überspringe.")
+                continue
 
-def submit_bracket_buy(
-    trading_client: TradingClient,
-    symbol: str,
-    qty: int,
-    entry_price: float,
-) -> None:
-    """Kauft per Market-Order inkl. Take-Profit / Stop-Loss (falls konfiguriert)."""
-    tp_req = None
-    sl_req = None
+            last_row = last_completed_daily_row(df)
+            if last_row is None:
+                print(f"[BOT] {symbol}: Keine abgeschlossene Tageskerze – überspringe.")
+                continue
 
-    if config.TAKE_PROFIT_PCT and config.TAKE_PROFIT_PCT > 0:
-        tp_price = round(entry_price * (1 + float(config.TAKE_PROFIT_PCT)), 2)
-        tp_req = TakeProfitRequest(limit_price=tp_price)
+            last_rsi = compute_rsi_on_df(df)
+            if last_rsi is None or np.isnan(last_rsi):
+                print(f"[BOT] {symbol}: Keine valide RSI-Berechnung – überspringe.")
+                continue
 
-    if config.STOP_LOSS_PCT and config.STOP_LOSS_PCT > 0:
-        sl_price = round(entry_price * (1 - float(config.STOP_LOSS_PCT)), 2)
-        # optional: limit_price für Stop-Limit setzen; hier reiner Stop-Market
-        sl_req = StopLossRequest(stop_price=sl_price)
+            action = decide_action(last_row["c"], last_rsi)
+            print(f"[BOT] {symbol}: Close={last_row['c']:.2f} • RSI={last_rsi:.1f} ⇒ {action}")
 
-    order = MarketOrderRequest(
-        symbol=symbol,
-        qty=qty,
-        side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY,
-        take_profit=tp_req,
-        stop_loss=sl_req,
-    )
-    trading_client.submit_order(order)
-    log(f"Order BUY {symbol} x{qty} (Bracket: TP={tp_req is not None}, SL={sl_req is not None}) gesendet.")
+            # TODO: Hier Orders platzieren (über Trading-API) – aktuell nur Log.
+            # Beispiel-Stub:
+            # place_order(symbol, action, qty=... )
 
+        except Exception as e:
+            print(f"[BOT] {symbol}: Fehler: {e}")
 
-def submit_market_sell(trading_client: TradingClient, symbol: str, qty: int) -> None:
-    order = MarketOrderRequest(
-        symbol=symbol,
-        qty=qty,
-        side=OrderSide.SELL,
-        time_in_force=TimeInForce.DAY,
-    )
-    trading_client.submit_order(order)
-    log(f"Order SELL {symbol} x{qty} gesendet.")
+    print("[BOT] Runde fertig.")
 
-
-# -------------- Strategie-Logik --------------
-
-def process_symbol(data_client, trading_client, symbol: str) -> None:
-    """Führt die Regeln für EIN Symbol aus."""
-    try:
-        last_close, last_rsi = fetch_last_close_and_rsi(
-            data_client,
-            symbol,
-            limit=200,
-            timeframe=config.TIMEFRAME,
-            rsi_period=config.RSI_PERIOD,
-        )
-
-        if last_close is None or last_rsi is None:
-            log(f"{symbol}: Keine valide Bar/RSI – überspringe.")
-            return
-
-        pos_qty = get_position_qty(trading_client, symbol)
-        log(f"{symbol}: Close={last_close:.2f}, RSI={last_rsi:.1f}, Position={pos_qty}")
-
-        # EXIT-Regel: RSI > RSI_UPPER und Position vorhanden -> verkaufen
-        if pos_qty > 0 and last_rsi >= config.RSI_UPPER:
-            submit_market_sell(trading_client, symbol, pos_qty)
-            return
-
-        # ENTRY-Regel: RSI < RSI_LOWER und KEINE Position -> kaufen
-        if pos_qty == 0 and last_rsi <= config.RSI_LOWER:
-            # Positionsgröße
-            raw_qty = config.MAX_TRADE_USD / last_close
-            qty = int(math.floor(raw_qty))
-            if qty <= 0:
-                log(f"{symbol}: MAX_TRADE_USD zu klein für Kauf – überspringe.")
-                return
-            submit_bracket_buy(trading_client, symbol, qty, last_close)
-            return
-
-        log(f"{symbol}: Keine Aktion.")
-
-    except Exception as e:
-        log(f"{symbol}: FEHLER: {e}")
-        traceback.print_exc()
-
-
-def run_once() -> None:
-    data_client, trading_client = get_clients()
-    log(f"Starte Runde • Feed={config.API_DATA_FEED} • TF={config.TIMEFRAME}")
-    for symbol in config.WATCHLIST:
-        process_symbol(data_client, trading_client, symbol)
-    log("Runde fertig.")
-
-
-def run_loop(sleep_seconds: int) -> None:
-    log(f"Starte Endlosschleife (Intervall {sleep_seconds}s).")
+def loop_forever(interval_sec: int = LOOP_INTERVAL_SEC):
+    print(f"[BOT] Starte Endlosschleife (Intervall {interval_sec}s).")
     while True:
-        run_once()
-        time.sleep(sleep_seconds)
+        trade_once()
+        time.sleep(interval_sec)
 
-
-# -------------- CLI --------------
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="RSI Mean-Reversion Trading Engine")
-    g = parser.add_mutually_exclusive_group(required=True)
-    g.add_argument("--once", action="store_true", help="Nur eine Runde ausführen und beenden")
-    g.add_argument("--loop", action="store_true", help="Endlosschleife mit Intervall (config.LOOP_SECONDS)")
-
-    args = parser.parse_args()
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--once", action="store_true", help="Eine Runde ausführen und beenden.")
+    p.add_argument("--loop", action="store_true", help="Endlosschleife.")
+    args = p.parse_args()
 
     if args.once:
-        run_once()
-    else:
-        run_loop(int(config.LOOP_SECONDS))
+        trade_once()
+        return
+    if args.loop:
+        loop_forever()
+        return
+
+    # Default: einmal ausführen
+    trade_once()
+
+if __name__ == "__main__":
+    main()
