@@ -1,6 +1,6 @@
 streamlit==1.49.1
 
-# Alpaca Marktdaten (neue API, enthält StockHistoricalDataClient)
+# Alpaca Marktdaten & Trading (enthält StockHistoricalDataClient)
 alpaca-py==0.20.0
 
 # Daten/Utils
