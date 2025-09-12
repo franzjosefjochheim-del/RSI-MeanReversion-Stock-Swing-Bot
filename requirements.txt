@@ -1,8 +1,17 @@
 streamlit==1.49.1
 
-# Alpaca SDK (neue Variante, enthält Trading + Market Data)
+# Alpaca Marktdaten (neue API, enthält StockHistoricalDataClient)
 alpaca-py==0.20.0
 
+# Daten/Utils
 pandas==2.3.2
 numpy==2.3.2
 requests==2.32.3
+
+# optional: Streamlit-Dependencies sauber halten
+altair<6,!=5.4.0,!=5.4.1
+pydeck>=0.8.0b4
+watchdog<7
+tornado<7,!=6.5.0
+tenacity>=8.1.0,<10
+typing-extensions<5
