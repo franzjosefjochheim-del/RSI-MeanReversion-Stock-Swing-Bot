@@ -14,7 +14,8 @@ import argparse
 import datetime as dt
 from typing import Optional, Dict, List
 
-from alpaca.data.historical.client import StockHistoricalDataClient
+from alpaca.data.historical import StockHistoricalDataClient
+
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 import pandas as pd
