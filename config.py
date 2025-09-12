@@ -17,10 +17,10 @@ if API_DATA_FEED not in {"iex", "sip"}:
 # ================================
 # Strategie-Parameter
 # ================================
-SYMBOLS = ["SPY", "QQQ", "AAPL", "MSFT"]   # Watchlist
-WATCHLIST = SYMBOLS                        # Alias für Rückwärtskompatibilität
+SYMBOLS = ["SPY", "QQQ", "AAPL", "MSFT"]
+WATCHLIST = SYMBOLS
 
-# IEX liefert im Paper-Plan keine Intraday-Bars → 1Day als Standard
+# IEX (Paper) liefert keine Intraday-Bars → 1Day
 TIMEFRAME = "1Day"
 FALLBACK_TIMEFRAME = "1Day"
 
@@ -38,39 +38,15 @@ TAKE_PROFIT_PCT = 0.06
 LOOP_SECONDS = 60 * 5
 
 # ================================
-# Trading-Client (nur falls Orders benötigt)
-# ================================
-try:
-    import alpaca_trade_api as tradeapi  # optional
-except Exception:
-    tradeapi = None
-
-@st.cache_resource(show_spinner=False)
-def get_trading_api():
-    """
-    Trading-Client aus alpaca_trade_api (nur nötig, wenn du Orders platzierst).
-    """
-    if tradeapi is None:
-        raise RuntimeError(
-            "alpaca_trade_api ist nicht installiert. "
-            "Füge es in requirements.txt hinzu, wenn du Orders platzieren willst."
-        )
-    if not (API_KEY and API_SECRET):
-        raise ValueError("APCA_API_KEY_ID / APCA_API_SECRET_KEY fehlen.")
-    return tradeapi.REST(API_KEY, API_SECRET, API_BASE_URL, api_version="v2")
-
-# ================================
 # Market-Data-Client (alpaca-py)
 # ================================
-# 👉 Wir nutzen eine kleine Kompatibilitätsdatei (alpaca_data_compat.py),
-#    damit 'MarketDataClient' so heißt wie in deiner App.
-from alpaca_data_compat import MarketDataClient  # liefert StockHistoricalDataClient
+from alpaca_data_compat import MarketDataClient  # -> StockHistoricalDataClient
 
 @st.cache_resource(show_spinner=False)
 def get_market_data_client() -> MarketDataClient:
     """
     Liefert den Historical Data Client (alpaca-py).
-    Für IEX sind Key/Secret ebenfalls nötig.
+    Für IEX sind Key/Secret nötig.
     """
     if not (API_KEY and API_SECRET):
         raise ValueError("APCA_API_KEY_ID / APCA_API_SECRET_KEY fehlen.")
@@ -86,5 +62,5 @@ __all__ = [
     "RSI_PERIOD", "RSI_LOWER", "RSI_UPPER",
     "MAX_TRADE_USD", "STOP_LOSS_PCT", "TAKE_PROFIT_PCT",
     "LOOP_SECONDS",
-    "get_trading_api", "get_market_data_client", "data_feed_label",
+    "get_market_data_client", "data_feed_label",
 ]
